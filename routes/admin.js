@@ -3,6 +3,21 @@ import { requireAuth, requireAdmin } from '../middleware/auth.js'
 import supabaseAdmin from '../server/lib/supabaseAdmin.js'
 
 const router = Router()
+const orderStatusValues = [
+  'Pending Payment',
+  'Paid',
+  'Awaiting Prescription',
+  'Under Review',
+  'Approved',
+  'Rejected',
+  'Processing',
+  'Ready',
+  'Out for Delivery',
+  'Delivered',
+  'Cancelled',
+  'Refunded',
+]
+const prescriptionReviewValues = ['Pending', 'Under Review', 'Approved', 'Rejected']
 
 function slugify(value) {
   return String(value || '')
@@ -74,6 +89,30 @@ function buildCategoryPayload(body) {
     description: String(body.description || '').trim() || null,
     is_active: body.isActive === undefined ? true : Boolean(body.isActive),
   }
+}
+
+function normalizeOrderStatus(value) {
+  const status = String(value || '').trim()
+
+  if (!orderStatusValues.includes(status)) {
+    throw new Error('Please choose a valid order status.')
+  }
+
+  return status
+}
+
+function normalizePrescriptionStatus(value) {
+  const status = String(value || '').trim()
+
+  if (!prescriptionReviewValues.includes(status)) {
+    throw new Error('Please choose a valid prescription review status.')
+  }
+
+  return status
+}
+
+function normalizeText(value) {
+  return String(value || '').trim()
 }
 
 router.get('/me', requireAuth, requireAdmin, (req, res) => {
@@ -163,6 +202,296 @@ router.get('/summary', requireAuth, requireAdmin, async (_req, res, next) => {
         revenue,
       },
     })
+  } catch (error) {
+    next(error)
+  }
+})
+
+router.get('/payments', requireAuth, requireAdmin, async (_req, res, next) => {
+  try {
+    const { data: payments, error: paymentsError } = await supabaseAdmin
+      .from('payments')
+      .select('id, order_id, reference, provider, status, amount, metadata, created_at, updated_at')
+      .order('created_at', { ascending: false })
+      .limit(50)
+
+    if (paymentsError) {
+      throw paymentsError
+    }
+
+    const orderIds = [...new Set((payments || []).map((payment) => payment.order_id).filter(Boolean))]
+
+    const { data: orders, error: ordersError } = orderIds.length
+      ? await supabaseAdmin
+          .from('orders')
+          .select('id, order_number, customer_name, customer_email, status, payment_status, total_amount')
+          .in('id', orderIds)
+      : { data: [], error: null }
+
+    if (ordersError) {
+      throw ordersError
+    }
+
+    const orderMap = new Map((orders || []).map((order) => [order.id, order]))
+
+    res.json({
+      payments: (payments || []).map((payment) => ({
+        ...payment,
+        order: orderMap.get(payment.order_id) || null,
+      })),
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
+router.get('/orders', requireAuth, requireAdmin, async (_req, res, next) => {
+  try {
+    const { data: orders, error } = await supabaseAdmin
+      .from('orders')
+      .select(
+        'id, order_number, customer_name, customer_email, customer_phone, status, payment_status, total_amount, requires_prescription, prescription_status, created_at, updated_at',
+      )
+      .order('created_at', { ascending: false })
+      .limit(50)
+
+    if (error) {
+      throw error
+    }
+
+    res.json({ orders: orders || [] })
+  } catch (error) {
+    next(error)
+  }
+})
+
+router.get('/orders/:id', requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const { data: order, error: orderError } = await supabaseAdmin
+      .from('orders')
+      .select(
+        'id, order_number, customer_name, customer_email, customer_phone, delivery_address, status, payment_status, requires_prescription, prescription_status, prescription_document_url, rejection_reason, total_amount, payment_reference, created_at, updated_at',
+      )
+      .eq('id', req.params.id)
+      .maybeSingle()
+
+    if (orderError) {
+      throw orderError
+    }
+
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found.' })
+    }
+
+    const [{ data: orderItems, error: orderItemsError }, { data: payment, error: paymentError }] =
+      await Promise.all([
+        supabaseAdmin
+          .from('order_items')
+          .select('id, quantity, unit_price, product_id, products(id, name, slug, images, prescription_required)')
+          .eq('order_id', order.id)
+          .order('created_at', { ascending: true }),
+        supabaseAdmin
+          .from('payments')
+          .select('id, order_id, reference, provider, status, amount, metadata, created_at, updated_at')
+          .eq('order_id', order.id)
+          .maybeSingle(),
+      ])
+
+    if (orderItemsError) {
+      throw orderItemsError
+    }
+
+    if (paymentError) {
+      throw paymentError
+    }
+
+    const { data: prescriptions, error: prescriptionsError } = await supabaseAdmin
+      .from('prescriptions')
+      .select('id, file_url, review_status, review_note, reviewed_at, reviewed_by')
+      .eq('order_id', order.id)
+      .order('created_at', { ascending: true })
+
+    if (prescriptionsError) {
+      throw prescriptionsError
+    }
+
+    const { data: history, error: historyError } = await supabaseAdmin
+      .from('order_status_history')
+      .select('id, previous_status, new_status, note, created_at, changed_by')
+      .eq('order_id', order.id)
+      .order('created_at', { ascending: false })
+
+    if (historyError) {
+      throw historyError
+    }
+
+    const changedByIds = [...new Set((history || []).map((entry) => entry.changed_by).filter(Boolean))]
+    const { data: changedByProfiles, error: changedByProfilesError } = changedByIds.length
+      ? await supabaseAdmin.from('profiles').select('id, full_name').in('id', changedByIds)
+      : { data: [], error: null }
+
+    if (changedByProfilesError) {
+      throw changedByProfilesError
+    }
+
+    const profileMap = new Map((changedByProfiles || []).map((profile) => [profile.id, profile.full_name]))
+
+    res.json({
+      order,
+      items: orderItems || [],
+      payment: payment || null,
+      prescriptions: prescriptions || [],
+      history: (history || []).map((entry) => ({
+        ...entry,
+        changed_by_name: profileMap.get(entry.changed_by) || 'Admin',
+      })),
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
+router.patch('/orders/:id', requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const { data: existingOrder, error: existingOrderError } = await supabaseAdmin
+      .from('orders')
+      .select('id, status, prescription_status')
+      .eq('id', req.params.id)
+      .maybeSingle()
+
+    if (existingOrderError) {
+      throw existingOrderError
+    }
+
+    if (!existingOrder) {
+      return res.status(404).json({ message: 'Order not found.' })
+    }
+
+    const updates = {}
+    const statusHistoryNote = normalizeText(req.body.statusNote || req.body.note || '')
+
+    if (req.body.paymentStatus !== undefined) {
+      const paymentStatus = String(req.body.paymentStatus || '').trim()
+      if (!['Unpaid', 'Paid', 'Failed', 'Refunded'].includes(paymentStatus)) {
+        throw new Error('Please choose a valid payment status.')
+      }
+      updates.payment_status = paymentStatus
+    }
+
+    if (req.body.rejectionReason !== undefined) {
+      updates.rejection_reason = normalizeText(req.body.rejectionReason) || null
+    }
+
+    if (req.body.prescriptionStatus !== undefined || req.body.prescriptionNote !== undefined) {
+      const prescriptionStatus =
+        req.body.prescriptionStatus !== undefined
+          ? normalizePrescriptionStatus(req.body.prescriptionStatus)
+          : null
+      const prescriptionNote = normalizeText(req.body.prescriptionNote)
+
+      const { data: latestPrescription, error: latestPrescriptionError } = await supabaseAdmin
+        .from('prescriptions')
+        .select('id')
+        .eq('order_id', req.params.id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+
+      if (latestPrescriptionError) {
+        throw latestPrescriptionError
+      }
+
+      if (!latestPrescription) {
+        throw new Error('Add a prescription before reviewing it.')
+      }
+
+      if (prescriptionStatus === 'Rejected' && !prescriptionNote) {
+        throw new Error('Add a rejection note before rejecting the prescription.')
+      }
+
+      const prescriptionUpdates = {}
+
+      if (req.body.prescriptionStatus !== undefined) {
+        prescriptionUpdates.review_status = prescriptionStatus
+      }
+
+      if (req.body.prescriptionNote !== undefined) {
+        prescriptionUpdates.review_note = prescriptionNote || null
+      }
+
+      if (req.body.prescriptionStatus !== undefined && prescriptionStatus !== 'Pending') {
+        prescriptionUpdates.reviewed_by = req.auth.user.id
+        prescriptionUpdates.reviewed_at = new Date().toISOString()
+      }
+
+      const { error: prescriptionUpdateError } = await supabaseAdmin
+        .from('prescriptions')
+        .update(prescriptionUpdates)
+        .eq('id', latestPrescription.id)
+
+      if (prescriptionUpdateError) {
+        throw prescriptionUpdateError
+      }
+
+      if (req.body.prescriptionStatus !== undefined) {
+        updates.prescription_status = prescriptionStatus
+
+        if (req.body.status === undefined) {
+          if (prescriptionStatus === 'Approved') {
+            updates.status = 'Approved'
+          }
+
+          if (prescriptionStatus === 'Rejected') {
+            updates.status = 'Rejected'
+            updates.rejection_reason = prescriptionNote
+          }
+
+          if (prescriptionStatus === 'Under Review') {
+            updates.status = 'Under Review'
+          }
+        }
+      }
+    }
+
+    if (req.body.status !== undefined) {
+      updates.status = normalizeOrderStatus(req.body.status)
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ message: 'No changes were provided.' })
+    }
+
+    const previousStatus = existingOrder.status
+    const nextStatus = updates.status ?? existingOrder.status
+
+    const { data, error } = await supabaseAdmin
+      .from('orders')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select(
+        'id, order_number, customer_name, customer_email, customer_phone, delivery_address, status, payment_status, requires_prescription, prescription_status, prescription_document_url, rejection_reason, total_amount, payment_reference, created_at, updated_at',
+      )
+      .single()
+
+    if (error) {
+      throw error
+    }
+
+    if (nextStatus !== previousStatus) {
+      const { error: historyError } = await supabaseAdmin.from('order_status_history').insert({
+        order_id: data.id,
+        previous_status: previousStatus,
+        new_status: nextStatus,
+        changed_by: req.auth.user.id,
+        note: statusHistoryNote || null,
+      })
+
+      if (historyError) {
+        throw historyError
+      }
+    }
+
+    res.json({ order: data })
   } catch (error) {
     next(error)
   }

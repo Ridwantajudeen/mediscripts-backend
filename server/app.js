@@ -10,7 +10,14 @@ app.use(
     origin: process.env.CORS_ORIGIN?.split(',').map((value) => value.trim()) || '*',
   }),
 )
-app.use(express.json({ limit: '2mb' }))
+app.use(
+  express.json({
+    limit: '2mb',
+    verify: (req, _res, buffer) => {
+      req.rawBody = buffer
+    },
+  }),
+)
 app.use(express.urlencoded({ extended: true }))
 
 app.get('/', (_req, res) => {
