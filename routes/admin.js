@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { requireAuth, requireAdmin } from '../middleware/auth.js'
 import supabaseAdmin from '../server/lib/supabaseAdmin.js'
+import { sendOrderConfirmationEmailIfNeeded } from '../server/lib/orderEmail.js'
 
 const router = Router()
 const orderStatusValues = [
@@ -355,7 +356,7 @@ router.patch('/orders/:id', requireAuth, requireAdmin, async (req, res, next) =>
   try {
     const { data: existingOrder, error: existingOrderError } = await supabaseAdmin
       .from('orders')
-      .select('id, status, prescription_status')
+      .select('id, status, prescription_status, confirmation_email_sent_at, customer_email, customer_name, order_number, payment_status, total_amount, delivery_address, customer_phone, created_at, updated_at, payment_reference, requires_prescription, prescription_document_url, rejection_reason')
       .eq('id', req.params.id)
       .maybeSingle()
 
@@ -469,7 +470,7 @@ router.patch('/orders/:id', requireAuth, requireAdmin, async (req, res, next) =>
       .update(updates)
       .eq('id', req.params.id)
       .select(
-        'id, order_number, customer_name, customer_email, customer_phone, delivery_address, status, payment_status, requires_prescription, prescription_status, prescription_document_url, rejection_reason, total_amount, payment_reference, created_at, updated_at',
+        'id, order_number, customer_name, customer_email, customer_phone, delivery_address, status, payment_status, requires_prescription, prescription_status, prescription_document_url, rejection_reason, total_amount, payment_reference, created_at, updated_at, confirmation_email_sent_at',
       )
       .single()
 
@@ -489,6 +490,12 @@ router.patch('/orders/:id', requireAuth, requireAdmin, async (req, res, next) =>
       if (historyError) {
         throw historyError
       }
+    }
+
+    try {
+      await sendOrderConfirmationEmailIfNeeded({ supabaseAdmin, order: data })
+    } catch (emailError) {
+      console.warn('Order confirmation email could not be sent:', emailError)
     }
 
     res.json({ order: data })

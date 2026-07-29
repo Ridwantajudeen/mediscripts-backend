@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import { Router } from 'express'
 import supabaseAdmin from '../server/lib/supabaseAdmin.js'
+import { sendOrderConfirmationEmailIfNeeded } from '../server/lib/orderEmail.js'
 
 const router = Router()
 const paystackApiBaseUrl = 'https://api.paystack.co'
@@ -138,7 +139,7 @@ async function loadPaymentContext(reference) {
   const { data: currentOrder, error: orderError } = await supabaseAdmin
     .from('orders')
     .select(
-      'id, order_number, customer_name, customer_email, customer_phone, delivery_address, status, payment_status, payment_reference, total_amount, created_at, updated_at',
+      'id, order_number, customer_name, customer_email, customer_phone, delivery_address, status, payment_status, payment_reference, total_amount, created_at, updated_at, confirmation_email_sent_at',
     )
     .eq('id', payment.order_id)
     .maybeSingle()
@@ -176,12 +177,18 @@ async function markPaymentVerified(payment, transactionPayload) {
     })
     .eq('id', payment.order_id)
     .select(
-      'id, order_number, customer_name, customer_email, customer_phone, delivery_address, status, payment_status, payment_reference, total_amount, created_at, updated_at',
+      'id, order_number, customer_name, customer_email, customer_phone, delivery_address, status, payment_status, payment_reference, total_amount, created_at, updated_at, confirmation_email_sent_at',
     )
     .single()
 
   if (updateOrderError) {
     throw updateOrderError
+  }
+
+  try {
+    await sendOrderConfirmationEmailIfNeeded({ supabaseAdmin, order: updatedOrder })
+  } catch (emailError) {
+    console.warn('Order confirmation email could not be sent:', emailError)
   }
 
   return { updatedPayment, updatedOrder }
@@ -404,6 +411,12 @@ router.get('/payments/verify', async (req, res, next) => {
     }
 
     if (payment.status === 'Verified' || currentOrder.payment_status === 'Paid') {
+      try {
+        await sendOrderConfirmationEmailIfNeeded({ supabaseAdmin, order: currentOrder })
+      } catch (emailError) {
+        console.warn('Order confirmation email could not be sent:', emailError)
+      }
+
       return res.json({
         verified: true,
         transactionStatus: 'success',
@@ -501,6 +514,12 @@ router.post('/payments/webhook', async (req, res, next) => {
     }
 
     if (payment.status === 'Verified' || currentOrder.payment_status === 'Paid') {
+      try {
+        await sendOrderConfirmationEmailIfNeeded({ supabaseAdmin, order: currentOrder })
+      } catch (emailError) {
+        console.warn('Order confirmation email could not be sent:', emailError)
+      }
+
       return res.json({ received: true, processed: true, verified: true })
     }
 

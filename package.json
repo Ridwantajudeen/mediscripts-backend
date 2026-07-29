@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "node --watch server/index.js",
     "start": "node server/index.js",
-    "db:setup": "echo 'Import schema.sql into your Supabase SQL editor'"
+    "db:setup": "echo 'Import the numbered files in backend/migrations into your Supabase SQL editor, in order.'"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",
