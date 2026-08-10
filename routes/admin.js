@@ -2,6 +2,8 @@ import { Router } from 'express'
 import { requireAuth, requireAdmin } from '../middleware/auth.js'
 import supabaseAdmin from '../server/lib/supabaseAdmin.js'
 import { sendOrderConfirmationEmailIfNeeded } from '../server/lib/orderEmail.js'
+import { listAdminActivityLogs, logAdminAction } from '../server/lib/adminAudit.js'
+import { loadTransferPaymentSettings, upsertTransferPaymentSettings, createTransferReceiptSignedUrl } from '../server/lib/transferPayments.js'
 
 const router = Router()
 const orderStatusValues = [
@@ -116,6 +118,24 @@ function normalizeText(value) {
   return String(value || '').trim()
 }
 
+async function loadLatestPaymentForOrder(orderId) {
+  const { data, error } = await supabaseAdmin
+    .from('payments')
+    .select(
+      'id, order_id, reference, provider, payment_method, status, amount, metadata, receipt_storage_path, receipt_note, receipt_status, receipt_submitted_at, receipt_reviewed_by, receipt_reviewed_at, created_at, updated_at',
+    )
+    .eq('order_id', orderId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  if (error) {
+    throw error
+  }
+
+  return data
+}
+
 router.get('/me', requireAuth, requireAdmin, (req, res) => {
   res.json({
     user: {
@@ -208,11 +228,57 @@ router.get('/summary', requireAuth, requireAdmin, async (_req, res, next) => {
   }
 })
 
+router.get('/payment-settings', requireAuth, requireAdmin, async (_req, res, next) => {
+  try {
+    const settings = await loadTransferPaymentSettings(supabaseAdmin)
+    res.json({ settings })
+  } catch (error) {
+    next(error)
+  }
+})
+
+router.patch('/payment-settings', requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const beforeSettings = await loadTransferPaymentSettings(supabaseAdmin)
+    const updatedSettings = await upsertTransferPaymentSettings(
+      supabaseAdmin,
+      req.body || {},
+      req.auth.user.id,
+    )
+
+    await logAdminAction({
+      supabaseAdmin,
+      actorId: req.auth.user.id,
+      action: 'update',
+      entityType: 'payment_settings',
+      entityId: '1',
+      summary: 'Updated transfer payment details.',
+      beforeData: beforeSettings,
+      afterData: updatedSettings,
+    })
+
+    res.json({ settings: updatedSettings })
+  } catch (error) {
+    next(error)
+  }
+})
+
+router.get('/activity-logs', requireAuth, requireAdmin, async (_req, res, next) => {
+  try {
+    const logs = await listAdminActivityLogs(supabaseAdmin, 100)
+    res.json({ logs })
+  } catch (error) {
+    next(error)
+  }
+})
+
 router.get('/payments', requireAuth, requireAdmin, async (_req, res, next) => {
   try {
     const { data: payments, error: paymentsError } = await supabaseAdmin
       .from('payments')
-      .select('id, order_id, reference, provider, status, amount, metadata, created_at, updated_at')
+      .select(
+        'id, order_id, reference, provider, payment_method, status, amount, metadata, receipt_storage_path, receipt_note, receipt_status, receipt_submitted_at, receipt_reviewed_by, receipt_reviewed_at, created_at, updated_at',
+      )
       .order('created_at', { ascending: false })
       .limit(50)
 
@@ -234,12 +300,19 @@ router.get('/payments', requireAuth, requireAdmin, async (_req, res, next) => {
     }
 
     const orderMap = new Map((orders || []).map((order) => [order.id, order]))
-
-    res.json({
-      payments: (payments || []).map((payment) => ({
+    const paymentsWithReceipts = await Promise.all(
+      (payments || []).map(async (payment) => ({
         ...payment,
+        receipt_url:
+          payment.receipt_storage_path && payment.receipt_status !== 'Not Submitted'
+            ? await createTransferReceiptSignedUrl(supabaseAdmin, payment.receipt_storage_path)
+            : null,
         order: orderMap.get(payment.order_id) || null,
       })),
+    )
+
+    res.json({
+      payments: paymentsWithReceipts,
     })
   } catch (error) {
     next(error)
@@ -251,7 +324,7 @@ router.get('/orders', requireAuth, requireAdmin, async (_req, res, next) => {
     const { data: orders, error } = await supabaseAdmin
       .from('orders')
       .select(
-        'id, order_number, customer_name, customer_email, customer_phone, status, payment_status, total_amount, requires_prescription, prescription_status, created_at, updated_at',
+        'id, order_number, customer_name, customer_email, customer_phone, status, payment_status, payment_method, total_amount, requires_prescription, prescription_status, created_at, updated_at',
       )
       .order('created_at', { ascending: false })
       .limit(50)
@@ -271,7 +344,7 @@ router.get('/orders/:id', requireAuth, requireAdmin, async (req, res, next) => {
     const { data: order, error: orderError } = await supabaseAdmin
       .from('orders')
       .select(
-        'id, order_number, customer_name, customer_email, customer_phone, delivery_address, status, payment_status, requires_prescription, prescription_status, prescription_document_url, rejection_reason, total_amount, payment_reference, created_at, updated_at',
+        'id, order_number, customer_name, customer_email, customer_phone, delivery_address, status, payment_status, payment_method, requires_prescription, prescription_status, prescription_document_url, rejection_reason, total_amount, payment_reference, created_at, updated_at',
       )
       .eq('id', req.params.id)
       .maybeSingle()
@@ -293,7 +366,9 @@ router.get('/orders/:id', requireAuth, requireAdmin, async (req, res, next) => {
           .order('created_at', { ascending: true }),
         supabaseAdmin
           .from('payments')
-          .select('id, order_id, reference, provider, status, amount, metadata, created_at, updated_at')
+          .select(
+            'id, order_id, reference, provider, payment_method, status, amount, metadata, receipt_storage_path, receipt_note, receipt_status, receipt_submitted_at, receipt_reviewed_by, receipt_reviewed_at, created_at, updated_at',
+          )
           .eq('order_id', order.id)
           .maybeSingle(),
       ])
@@ -305,6 +380,11 @@ router.get('/orders/:id', requireAuth, requireAdmin, async (req, res, next) => {
     if (paymentError) {
       throw paymentError
     }
+
+    const receiptUrl =
+      payment?.receipt_storage_path && payment.receipt_status !== 'Not Submitted'
+        ? await createTransferReceiptSignedUrl(supabaseAdmin, payment.receipt_storage_path)
+        : null
 
     const { data: prescriptions, error: prescriptionsError } = await supabaseAdmin
       .from('prescriptions')
@@ -340,7 +420,7 @@ router.get('/orders/:id', requireAuth, requireAdmin, async (req, res, next) => {
     res.json({
       order,
       items: orderItems || [],
-      payment: payment || null,
+      payment: payment ? { ...payment, receipt_url: receiptUrl } : null,
       prescriptions: prescriptions || [],
       history: (history || []).map((entry) => ({
         ...entry,
@@ -356,7 +436,9 @@ router.patch('/orders/:id', requireAuth, requireAdmin, async (req, res, next) =>
   try {
     const { data: existingOrder, error: existingOrderError } = await supabaseAdmin
       .from('orders')
-      .select('id, status, prescription_status, confirmation_email_sent_at, customer_email, customer_name, order_number, payment_status, total_amount, delivery_address, customer_phone, created_at, updated_at, payment_reference, requires_prescription, prescription_document_url, rejection_reason')
+      .select(
+        'id, status, prescription_status, confirmation_email_sent_at, customer_email, customer_name, order_number, payment_status, payment_method, total_amount, delivery_address, customer_phone, created_at, updated_at, payment_reference, requires_prescription, prescription_document_url, rejection_reason',
+      )
       .eq('id', req.params.id)
       .maybeSingle()
 
@@ -373,10 +455,14 @@ router.patch('/orders/:id', requireAuth, requireAdmin, async (req, res, next) =>
 
     if (req.body.paymentStatus !== undefined) {
       const paymentStatus = String(req.body.paymentStatus || '').trim()
-      if (!['Unpaid', 'Paid', 'Failed', 'Refunded'].includes(paymentStatus)) {
+      if (!['Unpaid', 'Pending Verification', 'Paid', 'Failed', 'Refunded'].includes(paymentStatus)) {
         throw new Error('Please choose a valid payment status.')
       }
       updates.payment_status = paymentStatus
+
+      if (paymentStatus === 'Paid' && req.body.status === undefined) {
+        updates.status = 'Paid'
+      }
     }
 
     if (req.body.rejectionReason !== undefined) {
@@ -478,6 +564,40 @@ router.patch('/orders/:id', requireAuth, requireAdmin, async (req, res, next) =>
       throw error
     }
 
+    let updatedPayment = null
+
+    if (updates.payment_status === 'Paid') {
+      const latestPayment = await loadLatestPaymentForOrder(data.id)
+
+      if (latestPayment) {
+        const paymentUpdate = {
+          status: 'Verified',
+          receipt_status: 'Verified',
+          receipt_reviewed_by: req.auth.user.id,
+          receipt_reviewed_at: new Date().toISOString(),
+          metadata: {
+            ...(latestPayment.metadata || {}),
+            verifiedBy: req.auth.user.id,
+            verifiedAt: new Date().toISOString(),
+          },
+        }
+
+        const { error: paymentUpdateError } = await supabaseAdmin
+          .from('payments')
+          .update(paymentUpdate)
+          .eq('id', latestPayment.id)
+
+        if (paymentUpdateError) {
+          throw paymentUpdateError
+        }
+
+        updatedPayment = {
+          ...latestPayment,
+          ...paymentUpdate,
+        }
+      }
+    }
+
     if (nextStatus !== previousStatus) {
       const { error: historyError } = await supabaseAdmin.from('order_status_history').insert({
         order_id: data.id,
@@ -494,11 +614,24 @@ router.patch('/orders/:id', requireAuth, requireAdmin, async (req, res, next) =>
 
     try {
       await sendOrderConfirmationEmailIfNeeded({ supabaseAdmin, order: data })
-    } catch (emailError) {
-      console.warn('Order confirmation email could not be sent:', emailError)
+    } catch {
     }
 
-    res.json({ order: data })
+    try {
+      await logAdminAction({
+        supabaseAdmin,
+        actorId: req.auth.user.id,
+        action: 'update',
+        entityType: 'order',
+        entityId: data.id,
+        summary: `Updated order ${data.order_number}.`,
+        beforeData: existingOrder,
+        afterData: data,
+      })
+    } catch {
+    }
+
+    res.json({ order: data, payment: updatedPayment })
   } catch (error) {
     next(error)
   }
@@ -563,6 +696,19 @@ router.post('/products', requireAuth, requireAdmin, async (req, res, next) => {
       throw error
     }
 
+    try {
+      await logAdminAction({
+        supabaseAdmin,
+        actorId: req.auth.user.id,
+        action: 'create',
+        entityType: 'product',
+        entityId: data.id,
+        summary: `Created product ${data.name}.`,
+        afterData: data,
+      })
+    } catch {
+    }
+
     res.status(201).json({ product: data })
   } catch (error) {
     next(error)
@@ -612,6 +758,19 @@ router.patch('/products/:id', requireAuth, requireAdmin, async (req, res, next) 
       throw error
     }
 
+    try {
+      await logAdminAction({
+        supabaseAdmin,
+        actorId: req.auth.user.id,
+        action: 'update',
+        entityType: 'product',
+        entityId: data.id,
+        summary: `Updated product ${data.name}.`,
+        afterData: data,
+      })
+    } catch {
+    }
+
     res.json({ product: data })
   } catch (error) {
     next(error)
@@ -627,6 +786,18 @@ router.delete('/products/:id', requireAuth, requireAdmin, async (req, res, next)
 
     if (error) {
       throw error
+    }
+
+    try {
+      await logAdminAction({
+        supabaseAdmin,
+        actorId: req.auth.user.id,
+        action: 'archive',
+        entityType: 'product',
+        entityId: req.params.id,
+        summary: 'Archived a product.',
+      })
+    } catch {
     }
 
     res.json({ message: 'Product archived.' })
@@ -666,6 +837,19 @@ router.post('/categories', requireAuth, requireAdmin, async (req, res, next) => 
       throw error
     }
 
+    try {
+      await logAdminAction({
+        supabaseAdmin,
+        actorId: req.auth.user.id,
+        action: 'create',
+        entityType: 'category',
+        entityId: data.id,
+        summary: `Created category ${data.name}.`,
+        afterData: data,
+      })
+    } catch {
+    }
+
     res.status(201).json({ category: data })
   } catch (error) {
     next(error)
@@ -702,6 +886,19 @@ router.patch('/categories/:id', requireAuth, requireAdmin, async (req, res, next
       throw error
     }
 
+    try {
+      await logAdminAction({
+        supabaseAdmin,
+        actorId: req.auth.user.id,
+        action: 'update',
+        entityType: 'category',
+        entityId: data.id,
+        summary: `Updated category ${data.name}.`,
+        afterData: data,
+      })
+    } catch {
+    }
+
     res.json({ category: data })
   } catch (error) {
     next(error)
@@ -717,6 +914,18 @@ router.delete('/categories/:id', requireAuth, requireAdmin, async (req, res, nex
 
     if (error) {
       throw error
+    }
+
+    try {
+      await logAdminAction({
+        supabaseAdmin,
+        actorId: req.auth.user.id,
+        action: 'archive',
+        entityType: 'category',
+        entityId: req.params.id,
+        summary: 'Archived a category.',
+      })
+    } catch {
     }
 
     res.json({ message: 'Category archived.' })

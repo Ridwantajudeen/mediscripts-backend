@@ -2,6 +2,8 @@ import crypto from 'node:crypto'
 import { Router } from 'express'
 import supabaseAdmin from '../server/lib/supabaseAdmin.js'
 import { sendOrderConfirmationEmailIfNeeded } from '../server/lib/orderEmail.js'
+import { loadTransferPaymentSettings, uploadTransferReceipt } from '../server/lib/transferPayments.js'
+import { sendResendEmail } from '../server/lib/resend.js'
 
 const router = Router()
 const paystackApiBaseUrl = 'https://api.paystack.co'
@@ -37,6 +39,16 @@ function normalizeCheckoutItem(item) {
   }
 
   return { productId, quantity }
+}
+
+function normalizePaymentMethod(value) {
+  const method = String(value || 'paystack').trim().toLowerCase()
+
+  if (!['paystack', 'transfer'].includes(method)) {
+    throw new Error('Please choose a valid payment method.')
+  }
+
+  return method
 }
 
 async function initializePaystackTransaction({ email, amount, reference, callbackUrl, metadata }) {
@@ -124,7 +136,9 @@ function signaturesMatch(expectedSignature, providedSignature) {
 async function loadPaymentContext(reference) {
   const { data: payment, error: paymentError } = await supabaseAdmin
     .from('payments')
-    .select('id, order_id, reference, status, amount, metadata')
+    .select(
+      'id, order_id, reference, status, amount, metadata, payment_method, receipt_storage_path, receipt_note, receipt_status, receipt_submitted_at, receipt_reviewed_by, receipt_reviewed_at',
+    )
     .eq('reference', reference)
     .maybeSingle()
 
@@ -139,7 +153,7 @@ async function loadPaymentContext(reference) {
   const { data: currentOrder, error: orderError } = await supabaseAdmin
     .from('orders')
     .select(
-      'id, order_number, customer_name, customer_email, customer_phone, delivery_address, status, payment_status, payment_reference, total_amount, created_at, updated_at, confirmation_email_sent_at',
+      'id, order_number, customer_name, customer_email, customer_phone, delivery_address, status, payment_status, payment_method, payment_reference, total_amount, created_at, updated_at, confirmation_email_sent_at',
     )
     .eq('id', payment.order_id)
     .maybeSingle()
@@ -162,7 +176,9 @@ async function markPaymentVerified(payment, transactionPayload) {
       },
     })
     .eq('reference', payment.reference)
-    .select('id, order_id, reference, status, amount, metadata')
+    .select(
+      'id, order_id, reference, status, amount, metadata, payment_method, receipt_storage_path, receipt_note, receipt_status, receipt_submitted_at, receipt_reviewed_by, receipt_reviewed_at',
+    )
     .single()
 
   if (updatePaymentError) {
@@ -177,7 +193,7 @@ async function markPaymentVerified(payment, transactionPayload) {
     })
     .eq('id', payment.order_id)
     .select(
-      'id, order_number, customer_name, customer_email, customer_phone, delivery_address, status, payment_status, payment_reference, total_amount, created_at, updated_at, confirmation_email_sent_at',
+      'id, order_number, customer_name, customer_email, customer_phone, delivery_address, status, payment_status, payment_method, payment_reference, total_amount, created_at, updated_at, confirmation_email_sent_at',
     )
     .single()
 
@@ -187,8 +203,7 @@ async function markPaymentVerified(payment, transactionPayload) {
 
   try {
     await sendOrderConfirmationEmailIfNeeded({ supabaseAdmin, order: updatedOrder })
-  } catch (emailError) {
-    console.warn('Order confirmation email could not be sent:', emailError)
+  } catch {
   }
 
   return { updatedPayment, updatedOrder }
@@ -205,7 +220,9 @@ async function markPaymentFailed(payment, transactionPayload) {
       },
     })
     .eq('reference', payment.reference)
-    .select('id, order_id, reference, status, amount, metadata')
+    .select(
+      'id, order_id, reference, status, amount, metadata, payment_method, receipt_storage_path, receipt_note, receipt_status, receipt_submitted_at, receipt_reviewed_by, receipt_reviewed_at',
+    )
     .single()
 
   if (failedPaymentError) {
@@ -215,8 +232,60 @@ async function markPaymentFailed(payment, transactionPayload) {
   return failedPayment
 }
 
+async function loadTransferOrder(orderNumber, email) {
+  const normalizedOrderNumber = String(orderNumber || '').trim()
+  const normalizedEmail = String(email || '').trim().toLowerCase()
+
+  const { data: order, error } = await supabaseAdmin
+    .from('orders')
+    .select(
+      'id, order_number, customer_name, customer_email, status, payment_status, payment_method, total_amount, payment_reference, created_at, updated_at, confirmation_email_sent_at',
+    )
+    .eq('order_number', normalizedOrderNumber)
+    .maybeSingle()
+
+  if (error) {
+    throw error
+  }
+
+  if (!order || String(order.customer_email || '').trim().toLowerCase() !== normalizedEmail) {
+    return null
+  }
+
+  return order
+}
+
+function buildTransferAdminEmail({ order, settings, receiptUrl }) {
+  const subject = `Transfer receipt submitted for ${order.order_number}`
+  const html = `
+    <div style="font-family: Arial, sans-serif; color: #0f172a; line-height: 1.6;">
+      <p>A transfer receipt was submitted for order <strong>${order.order_number}</strong>.</p>
+      <p><strong>Customer:</strong> ${order.customer_name}</p>
+      <p><strong>Email:</strong> ${order.customer_email}</p>
+      <p><strong>Amount:</strong> NGN ${Number(order.total_amount || 0).toLocaleString('en-NG')}</p>
+      <p><strong>Bank:</strong> ${settings.bank_name || 'Not set'}</p>
+      <p><strong>Account:</strong> ${settings.account_name || 'Not set'} (${settings.account_number || 'Not set'})</p>
+      <p><strong>Reference:</strong> ${order.order_number}</p>
+      ${receiptUrl ? `<p><a href="${receiptUrl}">Open receipt</a></p>` : ''}
+    </div>
+  `
+  const text = [
+    `A transfer receipt was submitted for order ${order.order_number}.`,
+    `Customer: ${order.customer_name}`,
+    `Email: ${order.customer_email}`,
+    `Amount: NGN ${Number(order.total_amount || 0).toLocaleString('en-NG')}`,
+    `Reference: ${order.order_number}`,
+    receiptUrl ? `Receipt: ${receiptUrl}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+
+  return { subject, html, text }
+}
+
 router.post('/checkout', async (req, res, next) => {
   try {
+    const paymentMethod = normalizePaymentMethod(req.body.paymentMethod)
     const customerName = String(req.body.customerName || '').trim()
     const customerEmail = String(req.body.customerEmail || '').trim()
     const customerPhone = String(req.body.customerPhone || '').trim()
@@ -302,12 +371,15 @@ router.post('/checkout', async (req, res, next) => {
         customer_phone: customerPhone,
         delivery_address: deliveryAddress,
         status: 'Pending Payment',
-        payment_status: 'Unpaid',
+        payment_status: paymentMethod === 'transfer' ? 'Pending Verification' : 'Unpaid',
+        payment_method: paymentMethod,
         requires_prescription: false,
         total_amount: totalAmount,
-        payment_reference: paymentReference,
+        payment_reference: paymentMethod === 'transfer' ? orderNumber : paymentReference,
       })
-      .select('id, order_number, total_amount, status, payment_status, payment_reference, created_at')
+      .select(
+        'id, order_number, total_amount, status, payment_status, payment_method, payment_reference, created_at',
+      )
       .single()
 
     if (orderError) {
@@ -328,35 +400,80 @@ router.post('/checkout', async (req, res, next) => {
       throw itemsError
     }
 
-    const { error: paymentError } = await supabaseAdmin.from('payments').insert({
+    const paymentRecord = {
       order_id: order.id,
-      provider: 'paystack',
-      reference: paymentReference,
-      status: 'Pending',
+      provider: paymentMethod === 'transfer' ? 'transfer' : 'paystack',
+      payment_method: paymentMethod,
+      reference: paymentMethod === 'transfer' ? order.order_number : paymentReference,
+      status: paymentMethod === 'transfer' ? 'Pending' : 'Pending',
       amount: totalAmount,
       metadata: {
         orderNumber,
         customerEmail,
+        paymentMethod,
       },
-    })
+    }
+
+    const { error: paymentError } = await supabaseAdmin.from('payments').insert(paymentRecord)
 
     if (paymentError) {
       throw paymentError
     }
 
+    if (paymentMethod === 'transfer') {
+      const settings = await loadTransferPaymentSettings(supabaseAdmin)
+
+      return res.status(201).json({
+        order: {
+          ...order,
+          items: lineItems.map((item) => {
+            const product = productMap.get(item.productId)
+            return {
+              productId: item.productId,
+              name: product?.name || 'Product',
+              quantity: item.quantity,
+              unitPrice: item.unitPrice,
+            }
+          }),
+        },
+        payment: {
+          reference: order.order_number,
+          paymentMethod: 'transfer',
+          status: 'Pending Verification',
+        },
+        transfer: {
+          settings,
+          reference: order.order_number,
+          receiptPath: `/checkout/transfer/${encodeURIComponent(order.order_number)}`,
+          receiptUrl: `${getFrontendUrl()}/checkout/transfer/${encodeURIComponent(order.order_number)}`,
+        },
+      })
+    }
+
     const callbackUrl = `${getFrontendUrl()}/checkout/success/${order.order_number}`
-    const paystackTransaction = await initializePaystackTransaction({
-      email: customerEmail,
-      amount: Math.round(Number(totalAmount || 0) * 100),
-      reference: paymentReference,
-      callbackUrl,
-      metadata: {
-        orderNumber: order.order_number,
-        customerName,
-        customerEmail,
-        customerPhone,
-      },
-    })
+    let paystackTransaction
+
+    try {
+      paystackTransaction = await initializePaystackTransaction({
+        email: customerEmail,
+        amount: Math.round(Number(totalAmount || 0) * 100),
+        reference: paymentReference,
+        callbackUrl,
+        metadata: {
+          orderNumber: order.order_number,
+          customerName,
+          customerEmail,
+          customerPhone,
+        },
+      })
+    } catch {
+      await supabaseAdmin.from('orders').delete().eq('id', order.id)
+
+      return res.status(503).json({
+        message:
+          'Online payment is temporarily unavailable. Please choose bank transfer or try again later.',
+      })
+    }
 
     await supabaseAdmin
       .from('payments')
@@ -367,6 +484,7 @@ router.post('/checkout', async (req, res, next) => {
           accessCode: paystackTransaction.access_code,
           authorizationUrl: paystackTransaction.authorization_url,
           callbackUrl,
+          paymentMethod,
         },
       })
       .eq('reference', paymentReference)
@@ -396,6 +514,146 @@ router.post('/checkout', async (req, res, next) => {
   }
 })
 
+router.get('/transfer/settings', async (_req, res, next) => {
+  try {
+    const settings = await loadTransferPaymentSettings(supabaseAdmin)
+
+    res.json({ settings })
+  } catch (error) {
+    next(error)
+  }
+})
+
+router.post('/transfer/receipt', async (req, res, next) => {
+  try {
+    const orderNumber = String(req.body.orderNumber || '').trim()
+    const email = String(req.body.email || '').trim()
+    const receiptDataUrl = String(req.body.receiptDataUrl || '').trim()
+    const note = String(req.body.note || '').trim()
+
+    if (!orderNumber) {
+      return res.status(400).json({ message: 'Order number is required.' })
+    }
+
+    if (!email) {
+      return res.status(400).json({ message: 'Email address is required.' })
+    }
+
+    if (!receiptDataUrl) {
+      return res.status(400).json({ message: 'Receipt file is required.' })
+    }
+
+    const order = await loadTransferOrder(orderNumber, email)
+
+    if (!order) {
+      return res.status(404).json({ message: 'We could not match that order and email.' })
+    }
+
+    if (order.payment_method !== 'transfer') {
+      return res.status(400).json({ message: 'This order does not use manual transfer payment.' })
+    }
+
+    const { data: payment, error: paymentError } = await supabaseAdmin
+      .from('payments')
+      .select('id, status, payment_method, reference, amount, receipt_storage_path, receipt_status')
+      .eq('order_id', order.id)
+      .maybeSingle()
+
+    if (paymentError) {
+      throw paymentError
+    }
+
+    if (!payment) {
+      return res.status(404).json({ message: 'Payment record not found.' })
+    }
+
+    const receiptFile = await uploadTransferReceipt({
+      supabaseAdmin,
+      orderNumber: order.order_number,
+      receiptDataUrl,
+    })
+
+    const { data: updatedPayment, error: updateError } = await supabaseAdmin
+      .from('payments')
+      .update({
+        receipt_storage_path: receiptFile.path,
+        receipt_note: note || null,
+        receipt_status: 'Submitted',
+        receipt_submitted_at: new Date().toISOString(),
+        status: 'Pending',
+        metadata: {
+          ...(payment.metadata || {}),
+          receiptFileName: receiptFile.path.split('/').pop(),
+          receiptSubmittedBy: email,
+        },
+      })
+      .eq('id', payment.id)
+      .select('id, order_id, reference, status, amount, metadata, payment_method, receipt_storage_path, receipt_note, receipt_status, receipt_submitted_at, receipt_reviewed_by, receipt_reviewed_at')
+      .single()
+
+    if (updateError) {
+      throw updateError
+    }
+
+    const settings = await loadTransferPaymentSettings(supabaseAdmin)
+    const signedReceiptUrl = await supabaseAdmin.storage
+      .from('transfer-receipts')
+      .createSignedUrl(receiptFile.path, 24 * 60 * 60)
+      .then((result) => result.data?.signedUrl || null)
+
+    const adminEmail = settings.notification_email || 'mediscriptsrx2@gmail.com'
+    const adminEmailPayload = await buildTransferAdminEmail({
+      order,
+      settings,
+      receiptUrl: signedReceiptUrl,
+    })
+
+    try {
+      await sendResendEmail({
+        to: adminEmail,
+        subject: adminEmailPayload.subject,
+        html: adminEmailPayload.html,
+        text: adminEmailPayload.text,
+      })
+    } catch {
+    }
+
+    try {
+      await sendResendEmail({
+        to: order.customer_email,
+        subject: `We received your transfer receipt for ${order.order_number}`,
+        html: `
+          <div style="font-family: Arial, sans-serif; color: #0f172a; line-height: 1.6;">
+            <p>Hello ${order.customer_name},</p>
+            <p>We received your transfer receipt for order <strong>${order.order_number}</strong>.</p>
+            <p>Our team is reviewing it now. We will update your order once the payment is confirmed.</p>
+            <p>You can track your order later using your order number and email.</p>
+          </div>
+        `,
+        text: [
+          `Hello ${order.customer_name},`,
+          '',
+          `We received your transfer receipt for order ${order.order_number}.`,
+          'Our team is reviewing it now.',
+          'You can track your order later using your order number and email.',
+        ].join('\n'),
+      })
+    } catch {
+    }
+
+    return res.status(201).json({
+      message: 'We received your receipt and we are reviewing it now.',
+      payment: updatedPayment,
+      order: {
+        ...order,
+        payment_status: 'Pending Verification',
+      },
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
 router.get('/payments/verify', async (req, res, next) => {
   try {
     const reference = String(req.query.reference || req.query.trxref || '').trim()
@@ -413,8 +671,7 @@ router.get('/payments/verify', async (req, res, next) => {
     if (payment.status === 'Verified' || currentOrder.payment_status === 'Paid') {
       try {
         await sendOrderConfirmationEmailIfNeeded({ supabaseAdmin, order: currentOrder })
-      } catch (emailError) {
-        console.warn('Order confirmation email could not be sent:', emailError)
+      } catch {
       }
 
       return res.json({
@@ -516,8 +773,7 @@ router.post('/payments/webhook', async (req, res, next) => {
     if (payment.status === 'Verified' || currentOrder.payment_status === 'Paid') {
       try {
         await sendOrderConfirmationEmailIfNeeded({ supabaseAdmin, order: currentOrder })
-      } catch (emailError) {
-        console.warn('Order confirmation email could not be sent:', emailError)
+      } catch {
       }
 
       return res.json({ received: true, processed: true, verified: true })

@@ -12,7 +12,7 @@ app.use(
 )
 app.use(
   express.json({
-    limit: '2mb',
+    limit: '15mb',
     verify: (req, _res, buffer) => {
       req.rawBody = buffer
     },

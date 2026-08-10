@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { requireAuth, requireAdmin } from '../middleware/auth.js'
 import supabaseAdmin from '../server/lib/supabaseAdmin.js'
+import { logAdminAction } from '../server/lib/adminAudit.js'
 
 const router = Router()
 
@@ -51,6 +52,20 @@ router.post('/adjustments', requireAuth, requireAdmin, async (req, res, next) =>
 
     if (error) {
       throw error
+    }
+
+    try {
+      await logAdminAction({
+        supabaseAdmin,
+        actorId: req.auth.user.id,
+        action: 'adjust',
+        entityType: 'inventory',
+        entityId: productId,
+        summary: `Adjusted stock by ${delta}.`,
+        beforeData: null,
+        afterData: data?.[0] || null,
+      })
+    } catch {
     }
 
     res.status(201).json({
