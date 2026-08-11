@@ -1,6 +1,8 @@
 import express from 'express'
 import cors from 'cors'
 import routes from '../routes/index.js'
+import sitemapRoutes from '../routes/sitemap.js'
+import supabaseAdmin from './lib/supabaseAdmin.js'
 import { notFoundHandler, errorHandler } from '../middleware/errorHandler.js'
 
 const app = express()
@@ -28,6 +30,7 @@ app.get('/', (_req, res) => {
 })
 
 app.use('/api', routes)
+app.use('/', sitemapRoutes)
 app.use(notFoundHandler)
 app.use(errorHandler)
 
