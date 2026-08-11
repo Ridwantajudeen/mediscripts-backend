@@ -2,11 +2,11 @@ import { Router } from 'express'
 import supabaseAdmin from '../server/lib/supabaseAdmin.js'
 
 const router = Router()
-const siteUrl = String(process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '')
 const staticPaths = ['', 'products', 'contact', 'track-order']
 
-router.get('/sitemap.xml', async (_req, res, next) => {
+router.get('/sitemap.xml', async (req, res, next) => {
   try {
+    const siteUrl = String(process.env.FRONTEND_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '')
     const { data, error } = await supabaseAdmin
       .from('products')
       .select('slug')
