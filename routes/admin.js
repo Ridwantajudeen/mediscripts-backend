@@ -4,6 +4,7 @@ import supabaseAdmin from '../server/lib/supabaseAdmin.js'
 import { sendOrderConfirmationEmailIfNeeded } from '../server/lib/orderEmail.js'
 import { listAdminActivityLogs, logAdminAction } from '../server/lib/adminAudit.js'
 import { loadTransferPaymentSettings, upsertTransferPaymentSettings, createTransferReceiptSignedUrl } from '../server/lib/transferPayments.js'
+import { loadStorefrontCollections } from '../server/lib/storefrontCollections.js'
 
 const router = Router()
 const orderStatusValues = [
@@ -118,6 +119,14 @@ function normalizeText(value) {
   return String(value || '').trim()
 }
 
+function normalizeIdList(values) {
+  if (!Array.isArray(values)) {
+    return []
+  }
+
+  return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))]
+}
+
 async function loadLatestPaymentForOrder(orderId) {
   const { data, error } = await supabaseAdmin
     .from('payments')
@@ -134,6 +143,44 @@ async function loadLatestPaymentForOrder(orderId) {
   }
 
   return data
+}
+
+async function replaceStorefrontCollections(supabaseAdminClient, featuredProductIds, promotionProductIds, createdBy) {
+  const { error: deleteError } = await supabaseAdminClient
+    .from('storefront_collections')
+    .delete()
+    .in('section_key', ['featured', 'promotion'])
+
+  if (deleteError) {
+    throw deleteError
+  }
+
+  const rows = [
+    ...featuredProductIds.map((productId, index) => ({
+      section_key: 'featured',
+      product_id: productId,
+      sort_order: index + 1,
+      created_by: createdBy,
+    })),
+    ...promotionProductIds.map((productId, index) => ({
+      section_key: 'promotion',
+      product_id: productId,
+      sort_order: index + 1,
+      created_by: createdBy,
+    })),
+  ]
+
+  if (rows.length === 0) {
+    return
+  }
+
+  const { error: insertError } = await supabaseAdminClient
+    .from('storefront_collections')
+    .insert(rows)
+
+  if (insertError) {
+    throw insertError
+  }
 }
 
 router.get('/me', requireAuth, requireAdmin, (req, res) => {
@@ -267,6 +314,131 @@ router.get('/activity-logs', requireAuth, requireAdmin, async (_req, res, next) 
   try {
     const logs = await listAdminActivityLogs(supabaseAdmin, 100)
     res.json({ logs })
+  } catch (error) {
+    next(error)
+  }
+})
+
+router.get('/homepage-sections', requireAuth, requireAdmin, async (_req, res, next) => {
+  try {
+    const sections = await loadStorefrontCollections(supabaseAdmin)
+    res.json(sections)
+  } catch (error) {
+    next(error)
+  }
+})
+
+router.patch('/homepage-sections', requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const featuredProductIds = normalizeIdList(req.body.featuredProductIds)
+    const promotionProductIds = normalizeIdList(req.body.promotionProductIds)
+
+    if (featuredProductIds.length > 5) {
+      throw new Error('Featured products can have at most 5 items.')
+    }
+
+    if (promotionProductIds.length > 5) {
+      throw new Error('Promotion products can have at most 5 items.')
+    }
+
+    const overlap = featuredProductIds.filter((productId) => promotionProductIds.includes(productId))
+
+    if (overlap.length > 0) {
+      throw new Error('A product can only appear in one storefront section at a time.')
+    }
+
+    const selectedProductIds = [...new Set([...featuredProductIds, ...promotionProductIds])]
+
+    if (selectedProductIds.length > 0) {
+      const { data: selectedProducts, error: selectedProductsError } = await supabaseAdmin
+        .from('products')
+        .select('id, is_active')
+        .in('id', selectedProductIds)
+
+      if (selectedProductsError) {
+        throw selectedProductsError
+      }
+
+      if ((selectedProducts || []).length !== selectedProductIds.length) {
+        throw new Error('One or more selected products could not be found.')
+      }
+
+      const inactiveProduct = (selectedProducts || []).find((product) => product.is_active === false)
+
+      if (inactiveProduct) {
+        throw new Error('One or more selected products are no longer active.')
+      }
+    }
+
+    const beforeData = await loadStorefrontCollections(supabaseAdmin)
+
+    const { error: saveError } = await supabaseAdmin.rpc('set_storefront_collections', {
+      p_featured_product_ids: featuredProductIds,
+      p_promotion_product_ids: promotionProductIds,
+      p_created_by: req.auth.user.id,
+    })
+
+    if (saveError) {
+      const message = String(saveError.message || '').toLowerCase()
+      if (
+        saveError.code === '42883' ||
+        saveError.code === '42P01' ||
+        message.includes('set_storefront_collections') ||
+        message.includes('storefront_collections')
+      ) {
+        try {
+          await replaceStorefrontCollections(
+            supabaseAdmin,
+            featuredProductIds,
+            promotionProductIds,
+            req.auth.user.id,
+          )
+        } catch {
+          const error = new Error('Storefront selections are not available right now.')
+          error.statusCode = 503
+          error.publicMessage = 'Storefront selections are not available right now.'
+          throw error
+        }
+
+        const afterData = await loadStorefrontCollections(supabaseAdmin)
+
+        try {
+          await logAdminAction({
+            supabaseAdmin,
+            actorId: req.auth.user.id,
+            action: 'update',
+            entityType: 'storefront_collections',
+            entityId: 'homepage-sections',
+            summary: 'Updated storefront sections.',
+            beforeData,
+            afterData,
+          })
+        } catch {
+        }
+
+        return res.json(afterData)
+      }
+
+      throw saveError
+    }
+
+    const afterData = await loadStorefrontCollections(supabaseAdmin)
+
+    try {
+      await logAdminAction({
+        supabaseAdmin,
+        actorId: req.auth.user.id,
+        action: 'update',
+        entityType: 'storefront_collections',
+        entityId: 'homepage-sections',
+        summary: 'Updated storefront sections.',
+        beforeData,
+        afterData,
+      })
+    } catch {
+    }
+
+    res.json(afterData)
   } catch (error) {
     next(error)
   }

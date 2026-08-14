@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import supabaseAdmin from '../server/lib/supabaseAdmin.js'
+import { loadStorefrontCollections } from '../server/lib/storefrontCollections.js'
 
 const router = Router()
 
@@ -14,7 +15,8 @@ router.get('/products', async (req, res, next) => {
     const categoryId = String(req.query.categoryId || '').trim()
     const search = String(req.query.q || '').trim()
     const start = (page - 1) * limit
-    const end = start + limit
+    const fetchLimit = limit + 1
+    const end = start + fetchLimit - 1
 
     let query = supabaseAdmin
       .from('products')
@@ -62,6 +64,15 @@ router.get('/products', async (req, res, next) => {
       limit,
       hasMore,
     })
+  } catch (error) {
+    next(error)
+  }
+})
+
+router.get('/homepage-sections', async (_req, res, next) => {
+  try {
+    const sections = await loadStorefrontCollections(supabaseAdmin)
+    res.json(sections)
   } catch (error) {
     next(error)
   }
